@@ -34,29 +34,6 @@ Ce projet a été développé dans le cadre d'un Master et propose une architect
 
 ---
 
-## 📂 Arborescence du Projet
-
-\`\`\`text
-📦 projet-principal
- ┣ 📂 backend/                 # API FastAPI et Modèles IA
- ┃ ┣ 📂 api/                   # Routes de l'API (recognize, quality)
- ┃ ┣ 📂 models/                # Architectures PyTorch (resnet18.py)
- ┃ ┃ ┗ 📂 weights/             # ⚠️ Fichiers de poids (.pth, .pt) à télécharger
- ┃ ┣ 📂 services/              # Logique métier (detector, encoder, quality_service)
- ┃ ┣ 📂 utils/                 # Scripts utilitaires et pré-traitement
- ┃ ┣ 📂 GraFIQs/               # Sous-module du modèle GraFIQs (backbones)
- ┃ ┗ 📜 main.py                # Point d'entrée du serveur Backend
- ┃
- ┗ 📂 frontend/                # Interface Utilisateur React/Vite
-   ┣ 📂 src/
-   ┃ ┣ 📂 assets/              # Images et logos
-   ┃ ┣ 📂 components/          # Composants réutilisables (Navbar, Hero, Modele...)
-   ┃ ┣ 📂 pages/               # Vues principales (DemoReconnaissance, DemoQualite...)
-   ┃ ┗ 📜 App.jsx              # Configuration du routage
-   ┗ 📜 package.json
-\`\`\`
-
----
 
 ## 🚀 Installation et Démarrage
 
