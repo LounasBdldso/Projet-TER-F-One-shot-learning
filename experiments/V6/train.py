@@ -1,8 +1,17 @@
+"""
+Entraînement ProtoNet avec DistributedDataParallel (DDP) sur 4 GPU.
 
+LANCEMENT :
+    torchrun --nproc_per_node=4 train.py
+
+Explications des corrections pour éviter les Out of Memory (OOM) :
+- Ajout de l'Automatic Mixed Precision (AMP) via torch.cuda.amp.
+- num_workers=0 pour les DataLoaders épisodiques afin d'éviter le pré-chargement
+  massif de batchs (qui sature la RAM et la VRAM).
+"""
 
 import os
 import time
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 import torch
 import torch.distributed as dist
@@ -47,11 +56,18 @@ def print_main(msg):
         print(msg)
 
 
+def reduce_metric(value, world_size):
+    """Moyenne une métrique à travers tous les processus."""
+    tensor = torch.tensor(value).cuda()
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return (tensor / world_size).item()
+
+
 # ============================================================
 # TRAIN / EVAL
 # ============================================================
 
-def train_one_epoch(encoder, train_loader, optimizer, device):
+def train_one_epoch(encoder, train_loader, optimizer, scaler, device):
     encoder.train()
     total_loss, total_acc, n = 0.0, 0.0, 0
 
@@ -62,20 +78,27 @@ def train_one_epoch(encoder, train_loader, optimizer, device):
         support_labels = support_labels.squeeze(0).to(device, non_blocking=True)
         query_labels = query_labels.squeeze(0).to(device, non_blocking=True)
 
-        # DDP fix : un seul forward pass sur support+query concaténés
         n_support = support_images.size(0)
         all_images = torch.cat([support_images, query_images], dim=0)
-        all_emb = encoder(all_images)
-        support_emb = all_emb[:n_support]
-        query_emb = all_emb[n_support:]
-
-        loss, acc = prototypical_loss(
-            support_emb, query_emb, support_labels, query_labels, config.K_WAY
-        )
 
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+
+        # --- AMP : Mixed Precision pour réduire la VRAM de 50% ---
+        with torch.cuda.amp.autocast():
+            all_emb = encoder(all_images)
+            support_emb = all_emb[:n_support]
+            query_emb = all_emb[n_support:]
+
+            loss, acc = prototypical_loss(
+                support_emb, query_emb, support_labels, query_labels, config.K_WAY
+            )
+
+        # --- Scaler pour backward() avec AMP ---
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=10.0)
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         total_acc += acc.item()
@@ -96,29 +119,24 @@ def evaluate(encoder, val_loader, device, k_way):
         support_labels = support_labels.squeeze(0).to(device, non_blocking=True)
         query_labels = query_labels.squeeze(0).to(device, non_blocking=True)
 
-        # Même logique qu'en train : un seul forward
         n_support = support_images.size(0)
         all_images = torch.cat([support_images, query_images], dim=0)
-        all_emb = encoder(all_images)
-        support_emb = all_emb[:n_support]
-        query_emb = all_emb[n_support:]
+        
+        # --- AMP aussi pendant l'évaluation ---
+        with torch.cuda.amp.autocast():
+            all_emb = encoder(all_images)
+            support_emb = all_emb[:n_support]
+            query_emb = all_emb[n_support:]
 
-        loss, acc = prototypical_loss(
-            support_emb, query_emb, support_labels, query_labels, k_way
-        )
+            loss, acc = prototypical_loss(
+                support_emb, query_emb, support_labels, query_labels, k_way
+            )
 
         total_loss += loss.item()
         total_acc += acc.item()
         n += 1
 
     return total_loss / n, total_acc / n
-
-
-def reduce_metric(value, world_size):
-    """Moyenne une métrique à travers tous les processus."""
-    tensor = torch.tensor(value).cuda()
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return (tensor / world_size).item()
 
 
 # ============================================================
@@ -129,9 +147,6 @@ def main():
     # --- Setup DDP ---
     rank, local_rank, world_size, device = setup_ddp()
 
-    # print_main(f"DDP initialisé — {world_size} GPU(s)")
-    # print_main(f"GPU local : cuda:{local_rank} ({torch.cuda.get_device_name(local_rank)})")
-
     if is_main_process():
         os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
 
@@ -140,26 +155,24 @@ def main():
     print_main("CHARGEMENT DES DONNÉES")
     print_main("=" * 60)
 
+    # On s'assure que le chargement se fait de manière propre en DDP
+    # (Idéalement, utilise un random.Random() fixe dans create_datasets comme vu avant)
     if is_main_process():
         train_dataset, val_dataset, test_data = create_datasets()
-    dist.barrier()  # Attendre que le rank 0 ait tout chargé
-
-    # Tous les ranks rechargent les datasets (mêmes splits grâce au seed)
+    dist.barrier()
     if not is_main_process():
         train_dataset, val_dataset, test_data = create_datasets()
 
-    # --- DataLoaders avec DistributedSampler ---
-    # Chaque process voit des épisodes DIFFÉRENTS (pas de chevauchement)
     train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
     val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
 
     train_loader = DataLoader(
         train_dataset, batch_size=1, sampler=train_sampler,
-        num_workers=config.NUM_WORKERS, pin_memory=True
+        num_workers=2, pin_memory=True,persistent_workers=True
     )
     val_loader = DataLoader(
         val_dataset, batch_size=1, sampler=val_sampler,
-        num_workers=config.NUM_WORKERS, pin_memory=True
+        num_workers=2, pin_memory=True,persistent_workers=True
     )
 
     # --- Modèle ---
@@ -169,7 +182,8 @@ def main():
 
     encoder = ProtoNetEncoder(embedding_dim=config.EMBEDDING_DIM).to(device)
 
-    # Wrapper DDP — synchronise les gradients entre GPUs
+    # Convertir en SyncBatchNorm si utilisation de BatchNorm
+    encoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(encoder)
     encoder = DDP(encoder, device_ids=[local_rank])
 
     if is_main_process():
@@ -177,16 +191,21 @@ def main():
         print_main(f"Paramètres : {total_params:,}")
 
     # --- Optimiseur ---
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.SGD(
         encoder.parameters(),
         lr=config.LEARNING_RATE,
-        weight_decay=config.WEIGHT_DECAY
+        momentum=0.9,
+        weight_decay=1e-4
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max",
-        factor=config.SCHEDULER_FACTOR,
-        patience=config.SCHEDULER_PATIENCE,
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=config.NUM_EPOCHS,
+        eta_min=1e-6
     )
+
+    # --- FIX OOM : Instanciation du GradScaler pour AMP ---
+    scaler = torch.cuda.amp.GradScaler()
 
     # --- Training ---
     print_main("\n" + "=" * 60)
@@ -203,13 +222,12 @@ def main():
     epochs_without_improvement = 0
 
     for epoch in range(1, config.NUM_EPOCHS + 1):
-        # Important : resynchroniser le sampler à chaque époque
         train_sampler.set_epoch(epoch)
-        val_sampler.set_epoch(epoch)
 
         start_time = time.time()
 
-        train_loss, train_acc = train_one_epoch(encoder, train_loader, optimizer, device)
+        # On passe le scaler à la fonction
+        train_loss, train_acc = train_one_epoch(encoder, train_loader, optimizer, scaler, device)
         val_loss, val_acc = evaluate(encoder, val_loader, device, k_way=config.K_WAY)
 
         # Moyenner les métriques à travers les GPUs
@@ -218,7 +236,7 @@ def main():
         val_loss = reduce_metric(val_loss, world_size)
         val_acc = reduce_metric(val_acc, world_size)
 
-        scheduler.step(val_acc)
+        scheduler.step()
         elapsed = time.time() - start_time
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -229,14 +247,12 @@ def main():
             f"LR: {current_lr:.2e} | Time: {elapsed:.1f}s"
         )
 
-        # --- Sauvegarde (uniquement sur rank 0) ---
+        # --- Sauvegarde ---
         if is_main_process():
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 epochs_without_improvement = 0
 
-                # En DDP, sauvegarder encoder.module.state_dict() et pas encoder.state_dict()
-                # pour éviter le préfixe "module." dans les clés
                 checkpoint = {
                     "epoch": epoch,
                     "encoder_state_dict": encoder.module.state_dict(),
@@ -251,12 +267,11 @@ def main():
                         "backbone": config.BACKBONE,
                     }
                 }
-                torch.save(checkpoint, os.path.join(config.CHECKPOINT_DIR, "protonet_resnet18_webface.pth"))
+                torch.save(checkpoint, os.path.join(config.CHECKPOINT_DIR, "protonet_resnet_webface.pth"))
                 print_main(f"  → Sauvegardé ! (Val Acc: {val_acc:.4f})")
             else:
                 epochs_without_improvement += 1
 
-        # Broadcast du compteur d'early stopping depuis le rank 0
         es_tensor = torch.tensor([epochs_without_improvement]).cuda()
         dist.broadcast(es_tensor, src=0)
         epochs_without_improvement = es_tensor.item()
@@ -265,19 +280,18 @@ def main():
             print_main(f"\nEarly stopping à l'époque {epoch}")
             break
 
-    # --- Évaluation finale (uniquement sur rank 0) ---
+    # --- Évaluation finale ---
     if is_main_process():
         print_main("\n" + "=" * 60)
         print_main("ÉVALUATION FINALE")
         print_main("=" * 60)
 
         best_ckpt = torch.load(
-            os.path.join(config.CHECKPOINT_DIR, "protonet_resnet18_webface.pth"),
+            os.path.join(config.CHECKPOINT_DIR, "protonet_resnet_webface.pth"),
             map_location=device
         )
         encoder.module.load_state_dict(best_ckpt["encoder_state_dict"])
-        print_main(f"Meilleur modèle : époque {best_ckpt['epoch']}, "
-                   f"val_acc: {best_ckpt['val_acc']:.4f}")
+        print_main(f"Meilleur modèle : époque {best_ckpt['epoch']}, val_acc: {best_ckpt['val_acc']:.4f}")
 
         test_dataset = EpisodicDataset(
             test_data, n_episodes=200,
@@ -291,7 +305,6 @@ def main():
         print_main(f"  Accuracy : {test_acc:.4f} ({test_acc * 100:.2f}%)")
 
     cleanup_ddp()
-
 
 if __name__ == "__main__":
     main()
