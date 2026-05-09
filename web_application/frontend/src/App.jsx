@@ -8,6 +8,7 @@ import Hero from "./components/hero"; // Remis en minuscule comme ton code d'ori
 import Recherche from "./components/Recherche";
 import Modele from "./components/Modele";
 import Demo from "./components/Demo";
+import Resultats from "./components/Resultats";
 
 import Pipeline from "./pages/pipeline"; // Remis en minuscule
 import DemoReconnaissance from "./pages/DemoReconnaissance";
@@ -36,6 +37,7 @@ const App = () => {
               <Recherche />
               <Modele />
               <Demo />
+              <Resultats />
             </>
           }
         />
